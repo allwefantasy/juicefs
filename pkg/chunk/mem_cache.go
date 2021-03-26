@@ -81,6 +81,11 @@ func (c *memcache) remove(key string) {
 	}
 }
 
+func (c *memcache) hierarchyDelete(key string) error{
+	c.remove(key)
+	return nil
+}
+
 func (c *memcache) load(key string) (ReadCloser, error) {
 	c.Lock()
 	defer c.Unlock()
@@ -118,5 +123,10 @@ func (c *memcache) cleanup() {
 func (c *memcache) stage(key string, data []byte, keepCache bool) (string, error) {
 	return "", errors.New("not supported")
 }
+
+func (c *memcache) hierarchySave(key string, data []byte) (string, error) {
+	return "", errors.New("not supported")
+}
+
 func (c *memcache) uploaded(key string, size int)  {}
 func (c *memcache) scanStaging() map[string]string { return nil }

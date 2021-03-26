@@ -37,4 +37,6 @@ type ChunkStore interface {
 	NewReader(chunkid uint64, length int) Reader
 	NewWriter(chunkid uint64) Writer
 	Remove(chunkid uint64, length int) error
+	HierarchyRemove(chunkid uint64, length int) error
+	This() interface{}
 }

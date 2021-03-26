@@ -20,8 +20,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/juicedata/juicefs/pkg/meta"
 	"io"
 	"io/ioutil"
+	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -140,46 +143,72 @@ func (c *rChunk) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 		}
 	}
 
-	if c.store.seekable && boff > 0 && len(p) <= blockSize/4 {
-		// partial read
-		st := time.Now()
-		in, err := c.store.storage.Get(key, int64(boff), int64(len(p)))
-		used := time.Since(st)
-		logger.Debugf("GET %s RANGE(%d,%d) (%s, %.3fs)", key, boff, len(p), err, used.Seconds())
-		if used > SlowRequest {
-			logger.Infof("slow request: GET %s (%s, %.3fs)", key, err, used.Seconds())
+	var goBackend = c.store.conf.StoreMode != "hierarchy"
+
+	if !goBackend {
+		// to get data from other node
+		// if fail, try to get data from object store
+		logger.Infof("get chunk key %s from other node", key)
+		address, err := meta.MetaClient.GetChunk(key)
+		if err != nil {
+			goBackend = true
+		} else {
+			logger.Infof("get chunk from  %s with chunk key %s", key, address)
+			resp, err := http.PostForm(fmt.Sprintf("http://%s", address), url.Values{"blockID": {key}})
+			if err != nil {
+				goBackend = true
+			} else {
+				defer resp.Body.Close()
+				return io.ReadFull(resp.Body, p)
+			}
+
 		}
-		c.store.fetcher.fetch(key)
-		if err == nil {
-			defer in.Close()
-			cacheMiss.Add(1)
-			cacheMissBytes.Add(float64(len(p)))
-			return io.ReadFull(in, p)
-		}
+
 	}
 
-	block, err := c.store.group.Execute(key, func() (*Page, error) {
-		tmp := page
-		if boff > 0 || len(p) < blockSize {
-			tmp = NewOffPage(blockSize)
-		} else {
-			tmp.Acquire()
+	if goBackend {
+		if c.store.seekable && boff > 0 && len(p) <= blockSize/4 {
+			// partial read
+			st := time.Now()
+			in, err := c.store.storage.Get(key, int64(boff), int64(len(p)))
+			used := time.Since(st)
+			logger.Debugf("GET %s RANGE(%d,%d) (%s, %.3fs)", key, boff, len(p), err, used.Seconds())
+			if used > SlowRequest {
+				logger.Infof("slow request: GET %s (%s, %.3fs)", key, err, used.Seconds())
+			}
+			c.store.fetcher.fetch(key)
+			if err == nil {
+				defer in.Close()
+				cacheMiss.Add(1)
+				cacheMissBytes.Add(float64(len(p)))
+				return io.ReadFull(in, p)
+			}
 		}
-		tmp.Acquire()
-		err := withTimeout(func() error {
-			defer tmp.Release()
-			return c.store.load(key, tmp, c.store.shouldCache(blockSize))
-		}, c.store.conf.GetTimeout)
-		return tmp, err
-	})
-	defer block.Release()
-	if err != nil {
-		return 0, err
+
+		block, err := c.store.group.Execute(key, func() (*Page, error) {
+			tmp := page
+			if boff > 0 || len(p) < blockSize {
+				tmp = NewOffPage(blockSize)
+			} else {
+				tmp.Acquire()
+			}
+			tmp.Acquire()
+			err := withTimeout(func() error {
+				defer tmp.Release()
+				return c.store.load(key, tmp, c.store.shouldCache(blockSize))
+			}, c.store.conf.GetTimeout)
+			return tmp, err
+		})
+		defer block.Release()
+		if err != nil {
+			return 0, err
+		}
+		if block != page {
+			copy(p, block.Data[boff:])
+		}
+		return len(p), nil
 	}
-	if block != page {
-		copy(p, block.Data[boff:])
-	}
-	return len(p), nil
+	return 0, errors.New(fmt.Sprintf("fetch block should not happen %s", key))
 }
 
 func (c *rChunk) delete(indx int) error {
@@ -192,6 +221,63 @@ func (c *rChunk) delete(indx int) error {
 		logger.Infof("slow request: DELETE %v (%s, %.3fs)", key, err, used.Seconds())
 	}
 	return err
+}
+
+func (c *rChunk) hierarchyDelete(indx int) error {
+	key := c.key(indx)
+	st := time.Now()
+	err := c.store.bcache.hierarchyDelete(key)
+	used := time.Since(st)
+	logger.Debugf("DELETE %v (%v, %.3fs)", key, err, used.Seconds())
+	if used > SlowRequest {
+		logger.Infof("slow request: DELETE %v (%s, %.3fs)", key, err, used.Seconds())
+	}
+	return err
+}
+
+func (c *rChunk) HierarchyRemove() error {
+	if c.length == 0 {
+		// no block
+		return nil
+	}
+
+	lastIndx := (c.length - 1) / c.store.conf.BlockSize
+	deleted := false
+	for i := 0; i <= lastIndx; i++ {
+		// there could be multiple clients try to remove the same chunk in the same time,
+		// any of them should succeed if any blocks is removed
+		key := c.key(i)
+
+		c.store.pendingMutex.Lock()
+		delete(c.store.pendingKeys, key)
+		c.store.pendingMutex.Unlock()
+		c.store.bcache.remove(key)
+
+		address, err := meta.MetaClient.GetChunk(key)
+
+		chunkid := strconv.FormatUint(c.id,10)
+		length := strconv.FormatInt(int64(c.length),10)
+
+		if err == nil && address != meta.CurrentJuiceFSClient.Address {
+			resp, _ := http.PostForm(fmt.Sprintf("http://%s", address),
+				url.Values{"action": {"remove"},
+					"chunkid": {chunkid},
+					"length": {length}})
+			logger.Infof("remote delete chunk %s from remote %s chunkid:%s length:%s", key, address,chunkid,length)
+			_, _ = ioutil.ReadAll(resp.Body)
+			resp.Body.Close()
+		} else {
+			logger.Infof("local delete chunk %s from remote %s chunkid:%s length:%s", key, address,chunkid,length)
+			c.hierarchyDelete(i)
+			c.delete(i)
+		}
+		deleted = true
+	}
+
+	if !deleted {
+		return errors.New("chunk not found")
+	}
+	return nil
 }
 
 func (c *rChunk) Remove() error {
@@ -486,17 +572,34 @@ func (c *wChunk) upload(indx int) {
 				logger.Fatalf("block length does not match: %v != %v", off, blen)
 			}
 		}
-		if c.store.conf.Writeback {
-			stagingPath, err := c.store.bcache.stage(key, block.Data, c.store.shouldCache(blen))
+
+		if c.store.conf.StoreMode == "hierarchy" {
+
+			diskPath, err := c.store.bcache.hierarchySave(key, block.Data)
+			// when fail to write to disk, try to write to object store.
 			if err != nil {
-				logger.Warnf("write %s to disk: %s, upload it directly", stagingPath, err)
+				logger.Warnf("write %s to disk: %s, upload it directly", diskPath, err)
 				c.syncUpload(key, block)
 			} else {
+				// mark where is the chunk
+				meta.MetaClient.RegisterChunk(meta.CurrentJuiceFSClient.Address, key)
+				block.Release()
 				c.errors <- nil
-				go c.asyncUpload(key, block, stagingPath)
 			}
+
 		} else {
-			c.syncUpload(key, block)
+			if c.store.conf.Writeback {
+				stagingPath, err := c.store.bcache.stage(key, block.Data, c.store.shouldCache(blen))
+				if err != nil {
+					logger.Warnf("write %s to disk: %s, upload it directly", stagingPath, err)
+					c.syncUpload(key, block)
+				} else {
+					c.errors <- nil
+					go c.asyncUpload(key, block, stagingPath)
+				}
+			} else {
+				c.syncUpload(key, block)
+			}
 		}
 	}()
 }
@@ -559,6 +662,10 @@ func (c *wChunk) Abort() {
 
 // Config contains options for cachedStore
 type Config struct {
+	StoreMode      string
+	StoreMemSize   int64
+	StoreDiskSize  int64
+	StoreDiskDir   string
 	CacheDir       string
 	CacheMode      os.FileMode
 	CacheSize      int64
@@ -591,6 +698,13 @@ type cachedStore struct {
 	seekable      bool
 }
 
+type WCachedStore struct {
+	Store *cachedStore
+}
+
+func (wstore *WCachedStore) ExternalFetch(key string) (ReadCloser, error) {
+	return wstore.Store.bcache.load(key)
+}
 func (store *cachedStore) load(key string, page *Page, cache bool) (err error) {
 	defer func() {
 		e := recover()
@@ -767,6 +881,15 @@ func (store *cachedStore) NewWriter(chunkid uint64) Writer {
 func (store *cachedStore) Remove(chunkid uint64, length int) error {
 	r := chunkForRead(chunkid, length, store)
 	return r.Remove()
+}
+
+func (store *cachedStore) HierarchyRemove(chunkid uint64, length int) error {
+	r := chunkForRead(chunkid, length, store)
+	return r.HierarchyRemove()
+}
+
+func (store *cachedStore) This() interface{} {
+	return WCachedStore{Store: store}
 }
 
 var _ ChunkStore = &cachedStore{}

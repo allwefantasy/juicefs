@@ -225,6 +225,39 @@ func (r *redisMeta) Init(format Format, force bool) error {
 	return r.rdb.Set(Background, r.inodeKey(1), r.marshal(&attr), 0).Err()
 }
 
+func (r *redisMeta) RegisterClientAndSync(name string, node JuiceFSClientNode) error {
+	nodeJson, _ := json.Marshal(node)
+	r.rdb.HSet(Background, "nodes", name, nodeJson)
+	logger.Infof("Register JuiceFS Client: %s", nodeJson)
+	go func() {
+		for {
+			body := r.rdb.HGetAll(Background, "nodes").Val()
+			for k, v := range body {
+				var node JuiceFSClientNode
+				json.Unmarshal([]byte(v), &node)
+				JuiceFSClients[k] = node
+			}
+			time.Sleep(10 * time.Second)
+		}
+	}()
+	return nil
+}
+
+func (r *redisMeta) RegisterChunk(address string, chunkID string) error {
+	status := r.rdb.Set(Background, fmt.Sprintf("rc_block_%s", chunkID), address, -1)
+	return status.Err()
+}
+
+func (r *redisMeta) GetChunk(chunkID string) (string, error) {
+	val, err := r.rdb.Get(Background, fmt.Sprintf("rc_block_%s", chunkID)).Result()
+	return val, err
+}
+
+func (r * redisMeta) RemoveChunk(chunkID string) error {
+	r.rdb.Del(Background,fmt.Sprintf("rc_block_%s", chunkID))
+	return nil
+}
+
 func (r *redisMeta) Load() (*Format, error) {
 	body, err := r.rdb.Get(Background, "setting").Bytes()
 	if err == redis.Nil {
@@ -254,7 +287,6 @@ func (r *redisMeta) NewSession() error {
 		logger.Warnf("load scriptLookup: %v", err)
 		r.shaLookup = ""
 	}
-
 	go r.refreshSession()
 	go r.cleanupDeletedFiles()
 	go r.cleanupSlices()

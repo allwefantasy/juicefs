@@ -28,6 +28,12 @@ const (
 	CompactChunk = 1001
 	// Rmr is a message to remove a directory recursively.
 	Rmr = 1002
+
+	//// NewClientIsMount is a message to  new JuiceFS client is mounted
+	//NewClientIsMount = 1003
+	//
+	//// ClientIsUmount is a message to  JuiceFS client is unmounted
+	//ClientIsUmount = 1004
 )
 
 const (
@@ -56,6 +62,10 @@ const (
 // MsgCallback is a callback for messages from meta service.
 type MsgCallback func(...interface{}) error
 
+type JuiceFSClientNode struct {
+	Name string // the client name, uuid
+	Address string // host:port
+}
 // Attr represents attributes of a node.
 type Attr struct {
 	Flags     uint8  // reserved flags
@@ -135,6 +145,11 @@ type Meta interface {
 	Load() (*Format, error)
 	// NewSession create a new client session.
 	NewSession() error
+
+	RegisterClientAndSync(instanceName string,node JuiceFSClientNode) error
+	RegisterChunk(address string,chunkID string) error
+	GetChunk(chunkID string) (string,error)
+	RemoveChunk(chunkID string) error
 
 	// StatFS returns summary statistics of a volume.
 	StatFS(ctx Context, totalspace, availspace, iused, iavail *uint64) syscall.Errno

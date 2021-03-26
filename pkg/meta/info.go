@@ -17,6 +17,7 @@ package meta
 
 import (
 	"fmt"
+	"github.com/google/uuid"
 	"strconv"
 	"strings"
 )
@@ -26,6 +27,8 @@ type version struct {
 }
 
 var oldestSupportedVer = version{2, 2, 0}
+var InstanceName  = uuid.New().String()
+var MetaClient Meta
 
 func parseVersion(v string) (ver version, err error) {
 	parts := strings.SplitN(v, ".", 3)

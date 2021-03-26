@@ -20,6 +20,9 @@ import (
 	"strconv"
 )
 
+var JuiceFSClients = make(map[string]JuiceFSClientNode)
+var CurrentJuiceFSClient JuiceFSClientNode
+
 type Ino uint64
 
 func (i Ino) String() string {

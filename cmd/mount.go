@@ -17,6 +17,8 @@ package main
 
 import (
 	"fmt"
+	"github.com/valyala/fasthttp"
+	"io/ioutil"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
@@ -25,6 +27,7 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -147,7 +150,6 @@ func mount(c *cli.Context) error {
 	if err != nil {
 		logger.Fatalf("load setting: %s", err)
 	}
-
 	mntLabels := prometheus.Labels{
 		"vol_name": format.Name,
 		"mp":       mp,
@@ -159,6 +161,11 @@ func mount(c *cli.Context) error {
 	chunkConf := chunk.Config{
 		BlockSize: format.BlockSize * 1024,
 		Compress:  format.Compression,
+		//cache/hierarchy
+		StoreMode:     c.String("store-mode"),
+		StoreMemSize:  int64(c.Int("store-mem-size")),
+		StoreDiskSize: int64(c.Int("store-disk-size")),
+		StoreDiskDir:  c.String("store-disk-dir"),
 
 		GetTimeout: time.Second * time.Duration(c.Int("get-timeout")),
 		PutTimeout: time.Second * time.Duration(c.Int("put-timeout")),
@@ -174,6 +181,15 @@ func mount(c *cli.Context) error {
 		CacheFullBlock: !c.Bool("cache-partial-only"),
 		AutoCreate:     true,
 	}
+
+	if chunkConf.StoreMode == "hierarchy" {
+		ds := utils.SplitDir(chunkConf.StoreDiskDir)
+		for i := range ds {
+			ds[i] = filepath.Join(ds[i], format.UUID)
+		}
+		chunkConf.StoreDiskDir = strings.Join(ds, string(os.PathListSeparator))
+	}
+
 	if chunkConf.CacheDir != "memory" {
 		ds := utils.SplitDir(chunkConf.CacheDir)
 		for i := range ds {
@@ -188,10 +204,16 @@ func mount(c *cli.Context) error {
 	logger.Infof("Data use %s", blob)
 	blob = object.WithMetrics(blob)
 	store := chunk.NewCachedStore(blob, chunkConf)
+
 	m.OnMsg(meta.DeleteChunk, meta.MsgCallback(func(args ...interface{}) error {
 		chunkid := args[0].(uint64)
 		length := args[1].(uint32)
-		return store.Remove(chunkid, int(length))
+		if chunkConf.StoreMode == "hierarchy" {
+			return store.HierarchyRemove(chunkid, int(length))
+		} else {
+			return store.Remove(chunkid, int(length))
+		}
+
 	}))
 	m.OnMsg(meta.CompactChunk, meta.MsgCallback(func(args ...interface{}) error {
 		slices := args[0].([]meta.Slice)
@@ -237,6 +259,55 @@ func mount(c *cli.Context) error {
 			logger.Fatalf("Failed to make daemon: %s", err)
 		}
 	}
+
+	meta.MetaClient = m
+
+	var portChan = make(chan int)
+
+	go func() {
+		requestHandler := func(ctx *fasthttp.RequestCtx) {
+			oriStore := store.This().(chunk.WCachedStore)
+
+			switch string(ctx.FormValue("action")) {
+			case "remove":
+				chunkId,_ := strconv.ParseUint(string(ctx.FormValue("chunkid")), 10, 64)
+				len,_ := strconv.Atoi(string(ctx.FormValue("length")))
+				store.HierarchyRemove(chunkId,len)
+				ss,_ := ioutil.ReadAll(strings.NewReader("success"))
+				ctx.Write(ss)
+				ctx.SetContentType("text/plain")
+			default:
+				blockID := ctx.FormValue("blockID")
+				reader, _ := oriStore.ExternalFetch(string(blockID))
+				ss, _ := ioutil.ReadAll(reader)
+				ctx.Write(ss)
+				ctx.SetContentType("application/octet-stream")
+
+			}
+
+		}
+		for port := 6050; port < 6100; port++ {
+			portChan <- port
+			_ = fasthttp.ListenAndServe(fmt.Sprintf("%s:%d", utils.GetIP(), port), requestHandler)
+		}
+	}()
+
+	go func() {
+		var port int
+		var wait = true
+		for wait {
+			select {
+			case port = <-portChan:
+			case <-time.After(10 * time.Second):
+				wait = false
+			}
+		}
+		meta.CurrentJuiceFSClient = meta.JuiceFSClientNode{
+			Name:    meta.InstanceName,
+			Address: fmt.Sprintf("%s:%d", utils.GetIP(), port),
+		}
+		m.RegisterClientAndSync(meta.InstanceName, meta.CurrentJuiceFSClient)
+	}()
 
 	go func() {
 		for port := 6060; port < 6100; port++ {
@@ -289,6 +360,26 @@ func clientFlags() []cli.Flag {
 		defaultCacheDir = path.Join(homeDir, ".juicefs", "cache")
 	}
 	return []cli.Flag{
+		&cli.StringFlag{
+			Name:  "store-mode",
+			Value: "cache",
+			Usage: "cache/hierarchy. Hierarchy mode means mem/disk/object store contains no duplicate data.",
+		},
+		&cli.StringFlag{
+			Name:  "store-disk-dir",
+			Value: "",
+			Usage: "directory paths of local disk, use colon to separate multiple paths",
+		},
+		&cli.IntFlag{
+			Name:  "store-mem-size",
+			Value: 1 << 10,
+			Usage: "size of memory storage in MiB",
+		},
+		&cli.IntFlag{
+			Name:  "store-disk-size",
+			Value: 1 << 10,
+			Usage: "size of local disk storage in MiB",
+		},
 		&cli.IntFlag{
 			Name:  "get-timeout",
 			Value: 60,

@@ -27,6 +27,7 @@ require (
 	github.com/jcmturner/gokrb5/v8 v8.4.2
 	github.com/juicedata/godaemon v0.0.0-20210118074000-659b6681b236
 	github.com/juju/ratelimit v1.0.1
+	github.com/klauspost/compress v1.11.12 // indirect
 	github.com/kr/fs v0.1.0 // indirect
 	github.com/ks3sdklib/aws-sdk-go v0.0.0-20180820074416-dafab05ad142
 	github.com/kurin/blazer v0.2.1
@@ -46,12 +47,13 @@ require (
 	github.com/tencentyun/cos-go-sdk-v5 v0.7.8
 	github.com/upyun/go-sdk/v3 v3.0.2
 	github.com/urfave/cli/v2 v2.3.0
+	github.com/valyala/fasthttp v1.22.0
 	github.com/viki-org/dnscache v0.0.0-20130720023526-c70c1f23c5d8
 	github.com/yunify/qingstor-sdk-go v2.2.15+incompatible
-	golang.org/x/crypto v0.0.0-20201124201722-c8d3bf9c5392
-	golang.org/x/net v0.0.0-20201216054612-986b41b23924
+	golang.org/x/crypto v0.0.0-20210220033148-5ea612d1eb83
+	golang.org/x/net v0.0.0-20210226101413-39120d07d75e
 	golang.org/x/oauth2 v0.0.0-20190517181255-950ef44c6e07
-	golang.org/x/sys v0.0.0-20210119212857-b64e53b001e4
+	golang.org/x/sys v0.0.0-20210225134936-a50acf3fe073
 	golang.org/x/term v0.0.0-20201126162022-7de9c90e9dd1
 	google.golang.org/api v0.5.0
 )

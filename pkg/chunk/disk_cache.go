@@ -47,6 +47,7 @@ type pendingFile struct {
 
 type cacheStore struct {
 	sync.Mutex
+	manager   *cacheManager
 	dir       string
 	mode      os.FileMode
 	capacity  int64
@@ -60,7 +61,7 @@ type cacheStore struct {
 	scanned bool
 }
 
-func newCacheStore(dir string, cacheSize int64, limit, pendingPages int, config *Config) *cacheStore {
+func newCacheStore(manager *cacheManager,dir string, cacheSize int64, limit, pendingPages int, config *Config) *cacheStore {
 	if config.CacheMode == 0 {
 		config.CacheMode = 0600 // only owner can read/write cache
 	}
@@ -68,6 +69,7 @@ func newCacheStore(dir string, cacheSize int64, limit, pendingPages int, config 
 		config.FreeSpace = 0.1 // 10%
 	}
 	c := &cacheStore{
+		manager: manager,
 		dir:       dir,
 		mode:      config.CacheMode,
 		capacity:  cacheSize,
@@ -213,6 +215,14 @@ func (cache *cacheStore) remove(key string) {
 	}
 }
 
+func (cache *cacheStore) hierarchyDelete(key string) error {
+	path := cache.diskPath(key)
+	if path != "" {
+		_ = os.Remove(path)
+	}
+	return nil
+}
+
 func (cache *cacheStore) load(key string) (ReadCloser, error) {
 	cache.Lock()
 	defer cache.Unlock()
@@ -239,6 +249,10 @@ func (cache *cacheStore) cachePath(key string) string {
 }
 
 func (cache *cacheStore) stagePath(key string) string {
+	return filepath.Join(cache.dir, stagingDir, key)
+}
+
+func (cache *cacheStore) diskPath(key string) string {
 	return filepath.Join(cache.dir, stagingDir, key)
 }
 
@@ -275,6 +289,22 @@ func (cache *cacheStore) add(key string, size int32, atime uint32) {
 	if cache.used > cache.capacity || len(cache.keys) > cache.limit {
 		cache.cleanup()
 	}
+}
+
+func (cache *cacheStore) hierarchySave(key string, data []byte) (string, error) {
+	diskPath := cache.diskPath(key)
+	err := cache.flushPage(diskPath, data, true)
+	if err == nil && cache.capacity > 0 {
+		realCache := cache.manager.getStore(key)
+		path := realCache.cachePath(key)
+		cache.createDir(filepath.Dir(path))
+		if err := os.Link(diskPath, path); err == nil {
+			realCache.add(key, 0, uint32(time.Now().Unix()))
+		} else {
+			logger.Warnf("link %s to %s: %s", diskPath, path, err)
+		}
+	}
+	return diskPath, err
 }
 
 func (cache *cacheStore) stage(key string, data []byte, keepCache bool) (string, error) {
@@ -439,7 +469,8 @@ func (cache *cacheStore) scanStaging() map[string]string {
 }
 
 type cacheManager struct {
-	stores []*cacheStore
+	stores     []*cacheStore
+	diskStores []*cacheStore
 }
 
 func keyHash(s string) uint32 {
@@ -487,22 +518,20 @@ func expandDir(pattern string) []string {
 type CacheManager interface {
 	cache(key string, p *Page)
 	remove(key string)
+	hierarchyDelete(key string) error
 	load(key string) (ReadCloser, error)
 	uploaded(key string, size int)
 	stage(key string, data []byte, keepCache bool) (string, error)
+	hierarchySave(key string, data []byte) (string, error)
 	scanStaging() map[string]string
 	stats() (int64, int64)
 }
 
-func newCacheManager(config *Config) CacheManager {
-	logger.Infof("Cache: %s capacity: %d MB", config.CacheDir, config.CacheSize)
-	if config.CacheDir == "memory" || config.CacheSize == 0 {
-		return newMemStore(config)
-	}
+func getDirs(dir string, autoCreate bool) []string {
 	var dirs []string
-	for _, d := range utils.SplitDir(config.CacheDir) {
+	for _, d := range utils.SplitDir(dir) {
 		dd := expandDir(d)
-		if config.AutoCreate {
+		if autoCreate {
 			dirs = append(dirs, dd...)
 		} else {
 			for _, d := range dd {
@@ -512,30 +541,61 @@ func newCacheManager(config *Config) CacheManager {
 			}
 		}
 	}
+	return dirs
+}
+
+func newCacheManager(config *Config) CacheManager {
+	logger.Infof("Cache: %s capacity: %d MB", config.CacheDir, config.CacheSize)
+	logger.Infof("Disk Store: %s capacity: %d MB", config.StoreDiskDir, config.StoreDiskSize)
+	if config.CacheDir == "memory" || config.CacheSize == 0 {
+		return newMemStore(config)
+	}
+	var dirs = getDirs(config.CacheDir, config.AutoCreate)
+	var diskDirs = getDirs(config.StoreDiskDir, config.AutoCreate)
+
 	if len(dirs) == 0 {
 		logger.Warnf("No cache dir existed")
 		return newMemStore(config)
 	}
 	sort.Strings(dirs)
+	sort.Strings(diskDirs)
+
+	m := &cacheManager{
+		stores:     make([]*cacheStore, len(dirs)),
+		diskStores: make([]*cacheStore, len(diskDirs)),
+	}
+	// 20% of buffer could be used for pending pages
+	pendingPages := config.BufferSize * 2 / 10 / config.BlockSize / len(dirs)
 	dirCacheSize := config.CacheSize << 20
 	dirCacheSize /= int64(len(dirs))
 	limit := dirCacheSize / int64(config.BlockSize) * 2
 	if limit < 1000000 {
 		limit = 1000000
 	}
-	m := &cacheManager{
-		stores: make([]*cacheStore, len(dirs)),
-	}
-	// 20% of buffer could be used for pending pages
-	pendingPages := config.BufferSize * 2 / 10 / config.BlockSize / len(dirs)
 	for i, d := range dirs {
-		m.stores[i] = newCacheStore(strings.TrimSpace(d)+string(filepath.Separator), dirCacheSize, int(limit), pendingPages, config)
+		m.stores[i] = newCacheStore(m,strings.TrimSpace(d)+string(filepath.Separator), dirCacheSize, int(limit), pendingPages, config)
 	}
+
+	// 20% of buffer could be used for pending pages
+	diskPendingPages := config.BufferSize * 2 / 10 / config.BlockSize / len(diskDirs)
+	diskDirCacheSize := config.StoreDiskSize << 20
+	diskDirCacheSize /= int64(len(diskDirs))
+	diskLimit := diskDirCacheSize / int64(config.BlockSize) * 2
+	if diskLimit < 1000000 {
+		diskLimit = 1000000
+	}
+	for i, d := range diskDirs {
+		m.diskStores[i] = newCacheStore(m,strings.TrimSpace(d)+string(filepath.Separator), diskDirCacheSize, int(diskLimit), diskPendingPages, config)
+	}
+
 	return m
 }
 
 func (m *cacheManager) getStore(key string) *cacheStore {
 	return m.stores[keyHash(key)%uint32(len(m.stores))]
+}
+func (m *cacheManager) getDiskStore(key string) *cacheStore {
+	return m.diskStores[keyHash(key)%uint32(len(m.diskStores))]
 }
 
 func (m *cacheManager) stats() (int64, int64) {
@@ -553,6 +613,13 @@ func (m *cacheManager) cache(key string, p *Page) {
 		return
 	}
 	m.getStore(key).cache(key, p)
+}
+
+func (m *cacheManager) hierarchyDelete(key string) error {
+	if len(m.stores) == 0 {
+		return nil
+	}
+	return m.getStore(key).hierarchyDelete(key)
 }
 
 type ReadCloser interface {
@@ -579,6 +646,13 @@ func (m *cacheManager) stage(key string, data []byte, keepCache bool) (string, e
 		return "", errors.New("no cache dir")
 	}
 	return m.getStore(key).stage(key, data, keepCache)
+}
+
+func (m *cacheManager) hierarchySave(key string, data []byte) (string, error) {
+	if len(m.diskStores) == 0 {
+		return "", errors.New("no disk dir")
+	}
+	return m.getDiskStore(key).hierarchySave(key, data)
 }
 
 func (m *cacheManager) uploaded(key string, size int) {

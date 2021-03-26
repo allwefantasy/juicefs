@@ -108,4 +108,13 @@ func (s *diskStore) Remove(chunkid uint64, length int) error {
 	return os.Remove(s.chunkPath(chunkid))
 }
 
+func (s *diskStore) HierarchyRemove(chunkid uint64, length int) error {
+	return s.Remove(chunkid,length)
+}
+
+func (store *diskStore) This() interface{} {
+	logger.Info("should not happen here diskStore.This")
+	return nil
+}
+
 var _ ChunkStore = &diskStore{}
